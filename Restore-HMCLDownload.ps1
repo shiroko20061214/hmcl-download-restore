@@ -130,22 +130,37 @@ function Find-HmclDir {
     $procs = @(Get-CimInstance Win32_Process -Filter "Name='java.exe' OR Name='javaw.exe' OR Name LIKE 'HMCL%'" -ErrorAction SilentlyContinue |
                Where-Object { $_.CommandLine -and $_.CommandLine -match 'HMCL' })
     foreach ($p in $procs) {
-        # a) 进程自身所在目录（少数情况下 HMCL 本体就是进程）
+        # a) 从 java 可执行文件往上找若干层。
+        #    覆盖「HMCL 自带 JRE」的情况：java 就在 HMCL 目录内部（如 <HMCL>\jre\bin\java.exe），
+        #    所有用户使用的 java 路径各不相同，所以不能假定 java 在系统目录。
         if ($p.ExecutablePath) {
             $d = Split-Path -Parent $p.ExecutablePath
-            if (Test-HmclDir $d) { return (Resolve-Path -LiteralPath $d).Path }
+            for ($i = 0; $i -lt 4 -and $d; $i++) {
+                if (Test-HmclDir $d) { return (Resolve-Path -LiteralPath $d).Path }
+                $parent = Split-Path -Parent $d
+                if (-not $parent -or $parent -eq $d) { break }
+                $d = $parent
+            }
         }
-        # b) HMCL 的 .exe 只是一层外壳：它会用系统 java 启动，并且把主程序名
-        #    作为「相对路径」传给 -jar，随后外壳自己退出。
-        #    因此进程的 ExecutablePath 指向的是 java.exe 所在目录，不是 HMCL 目录。
-        #    这里从命令行里取出主程序文件名，再到有限的几个根目录反查。
+        # b) HMCL 的 .exe 只是一层外壳：它会用某个 java 启动，并把主程序路径传给 -jar，
+        #    随后外壳自己退出。所以进程的 ExecutablePath 未必是 HMCL 目录。
+        #    这里分两种情况从命令行取：
+        #      - 绝对路径：直接看它所在目录
+        #      - 相对路径：只知道文件名，到有限的几个根目录反查
         $m = [regex]::Match([string]$p.CommandLine, '-jar\s+"?([^"\s]+)"?')
         if ($m.Success) {
-            $leaf = Split-Path -Leaf $m.Groups[1].Value
-            foreach ($root in (Get-SearchRoots)) {
-                $hit = Get-ChildItem -LiteralPath $root -Filter $leaf -Recurse -Depth 3 -File -ErrorAction SilentlyContinue |
-                       Select-Object -First 1
-                if ($hit) { return (Split-Path -Parent $hit.FullName) }
+            $jarArg = $m.Groups[1].Value.Trim('"')
+            if ([System.IO.Path]::IsPathRooted($jarArg)) {
+                $cand = Split-Path -Parent $jarArg
+                if (Test-HmclDir $cand) { return (Resolve-Path -LiteralPath $cand).Path }
+            }
+            $leaf = Split-Path -Leaf $jarArg
+            if ($leaf) {
+                foreach ($root in (Get-SearchRoots)) {
+                    $hit = Get-ChildItem -LiteralPath $root -Filter $leaf -Recurse -Depth 3 -File -ErrorAction SilentlyContinue |
+                           Select-Object -First 1
+                    if ($hit) { return (Split-Path -Parent $hit.FullName) }
+                }
             }
         }
     }
@@ -231,22 +246,28 @@ function Get-DataSnapshot {
     #    不含 logs\、cache\、dependencies\（运行时会自然变动，算进去会误报）
     #    也不含本工具要改的 launcher-settings.json 及其备份
     $localHome = Get-HmclLocalHome -Dir $Dir
-    if (Test-Path -LiteralPath $localHome) {
+    $exists = Test-Path -LiteralPath $localHome
+    $files = @()
+    if ($exists) {
         $watch = @((Join-Path $localHome 'config'), (Join-Path $localHome 'state'))
         $files = @($watch |
                    Where-Object { Test-Path -LiteralPath $_ } |
                    ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -File -Force -ErrorAction SilentlyContinue } |
                    Where-Object { $_.Name -ne 'launcher-settings.json' -and $_.Name -notlike 'launcher-settings.json.bak*' } |
                    Sort-Object FullName)
-        $sb = New-Object System.Text.StringBuilder
-        foreach ($f in $files) {
-            [void]$sb.Append($f.FullName.Substring($localHome.Length)).Append('|').Append($f.Length).Append('|').Append($f.LastWriteTimeUtc.Ticks).Append("`n")
-        }
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        $fp = [BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sb.ToString()))).Replace('-','').Substring(0,16)
+    }
+    # 无论目录是否存在都算同一个哈希：空输入也有确定值，
+    # 这样「操作前还没有 .hmcl、操作后被创建」不会被误判成数据变化。
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($f in $files) {
+        [void]$sb.Append($f.FullName.Substring($localHome.Length)).Append('|').Append($f.Length).Append('|').Append($f.LastWriteTimeUtc.Ticks).Append("`n")
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $fp = [BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sb.ToString()))).Replace('-','').Substring(0,16)
+    if ($exists) {
         [void]$lines.Add("启动器配置：$($files.Count) 个文件，指纹 $fp")
     } else {
-        [void]$lines.Add('启动器配置：尚未生成（首次运行前）')
+        [void]$lines.Add("启动器配置：尚未生成（指纹 $fp）")
     }
 
     # 2) 游戏目录统计（完全按 HMCL 自己的配置来，不做任何假设）
