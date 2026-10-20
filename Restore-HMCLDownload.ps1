@@ -109,6 +109,16 @@ function Test-HmclDir {
       Where-Object { $_.Name -match '^HMCL.*\.(exe|jar)$' }).Count -gt 0
 }
 
+function Get-SearchRoots {
+    $r = New-Object System.Collections.ArrayList
+    if ($PSScriptRoot) { [void]$r.Add($PSScriptRoot) }
+    try { [void]$r.Add((Get-Location).Path) } catch { }
+    $desk = [Environment]::GetFolderPath('Desktop');       if ($desk) { [void]$r.Add($desk) }
+    $dl   = [Environment]::GetFolderPath('MyDocuments');   if ($dl)   { [void]$r.Add($dl) }
+    if ($env:USERPROFILE) { [void]$r.Add((Join-Path $env:USERPROFILE 'Downloads')) }
+    return @($r | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)
+}
+
 function Find-HmclDir {
     param([string]$Hint)
     if ($Hint) {
@@ -117,15 +127,40 @@ function Find-HmclDir {
         return (Resolve-Path -LiteralPath $Hint).Path
     }
     # 1) 正在运行的 HMCL
-    $p = Get-CimInstance Win32_Process -Filter "Name='java.exe' OR Name='javaw.exe' OR Name LIKE 'HMCL%'" -ErrorAction SilentlyContinue |
-         Where-Object { $_.CommandLine -and $_.CommandLine -match 'HMCL' } | Select-Object -First 1
-    if ($p -and $p.ExecutablePath) {
-        $d = Split-Path -Parent $p.ExecutablePath
-        if (Test-HmclDir $d) { return $d }
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='java.exe' OR Name='javaw.exe' OR Name LIKE 'HMCL%'" -ErrorAction SilentlyContinue |
+               Where-Object { $_.CommandLine -and $_.CommandLine -match 'HMCL' })
+    foreach ($p in $procs) {
+        # a) 进程自身所在目录（少数情况下 HMCL 本体就是进程）
+        if ($p.ExecutablePath) {
+            $d = Split-Path -Parent $p.ExecutablePath
+            if (Test-HmclDir $d) { return (Resolve-Path -LiteralPath $d).Path }
+        }
+        # b) HMCL 的 .exe 只是一层外壳：它会用系统 java 启动，并且把主程序名
+        #    作为「相对路径」传给 -jar，随后外壳自己退出。
+        #    因此进程的 ExecutablePath 指向的是 java.exe 所在目录，不是 HMCL 目录。
+        #    这里从命令行里取出主程序文件名，再到有限的几个根目录反查。
+        $m = [regex]::Match([string]$p.CommandLine, '-jar\s+"?([^"\s]+)"?')
+        if ($m.Success) {
+            $leaf = Split-Path -Leaf $m.Groups[1].Value
+            foreach ($root in (Get-SearchRoots)) {
+                $hit = Get-ChildItem -LiteralPath $root -Filter $leaf -Recurse -Depth 3 -File -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
+                if ($hit) { return (Split-Path -Parent $hit.FullName) }
+            }
+        }
     }
     # 2) 脚本目录 / 当前目录
     foreach ($d in @($PSScriptRoot, (Get-Location).Path)) {
         if ($d -and (Test-HmclDir $d)) { return (Resolve-Path -LiteralPath $d).Path }
+    }
+    # 3) 交互式兜底
+    Write-Host ''
+    Write-Host '  未能自动定位 HMCL 目录。' -ForegroundColor Yellow
+    $asked = Read-Host '  请把 HMCL 目录拖到本窗口后回车（或直接输入路径，留空取消）'
+    if ($asked) {
+        $asked = $asked.Trim('"', ' ', "'")
+        if (Test-HmclDir $asked) { return (Resolve-Path -LiteralPath $asked).Path }
+        throw "该目录下没有 HMCL 主程序：$asked"
     }
     throw '找不到 HMCL。请用 -HmclDir 指定 HMCL 所在目录。'
 }
@@ -192,10 +227,15 @@ function Get-DataSnapshot {
     $lines = New-Object System.Collections.ArrayList
     $fp = ''
 
-    # 1) 配置目录指纹（排除本工具要改的那一个文件及其备份）
+    # 1) 配置指纹：只看 config\ 与 state\
+    #    不含 logs\、cache\、dependencies\（运行时会自然变动，算进去会误报）
+    #    也不含本工具要改的 launcher-settings.json 及其备份
     $localHome = Get-HmclLocalHome -Dir $Dir
     if (Test-Path -LiteralPath $localHome) {
-        $files = @(Get-ChildItem -LiteralPath $localHome -Recurse -File -Force -ErrorAction SilentlyContinue |
+        $watch = @((Join-Path $localHome 'config'), (Join-Path $localHome 'state'))
+        $files = @($watch |
+                   Where-Object { Test-Path -LiteralPath $_ } |
+                   ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -File -Force -ErrorAction SilentlyContinue } |
                    Where-Object { $_.Name -ne 'launcher-settings.json' -and $_.Name -notlike 'launcher-settings.json.bak*' } |
                    Sort-Object FullName)
         $sb = New-Object System.Text.StringBuilder
